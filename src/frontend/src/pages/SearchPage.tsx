@@ -1,0 +1,1413 @@
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  AlertTriangle,
+  Camera,
+  CheckCircle,
+  Eye,
+  EyeOff,
+  Loader2,
+  Search,
+  ShieldAlert,
+  SwitchCamera,
+  Upload,
+  Video,
+  X,
+} from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { ChildRecord } from "../backend";
+import { Status } from "../backend";
+import { useCamera } from "../camera/useCamera";
+import Navbar from "../components/Navbar";
+import {
+  useAddAlert,
+  useGetAllCases,
+  useUpdateStatusToFound,
+} from "../hooks/useQueries";
+import {
+  areModelsLoaded,
+  clearSearchFaceCache,
+  computeFrameVariance,
+  computeMatchScore,
+  detectFaceInImage,
+  ensureModelsLoaded,
+  extractHistogram,
+  loadImageToCanvas,
+} from "../utils/imageAnalysis";
+
+interface MatchResult {
+  record: ChildRecord;
+  score: number;
+}
+
+type SearchPhase =
+  | "idle"
+  | "loading-models"
+  | "preprocessing"
+  | "analyzing"
+  | "age-progression"
+  | "fetching"
+  | "extracting-frames"
+  | "analyzing-frames"
+  | "done";
+
+const PHASE_MESSAGES: Partial<Record<SearchPhase, string>> = {
+  "loading-models": "Loading face recognition models...",
+  preprocessing: "Preprocessing image...",
+  analyzing: "Extracting face descriptors...",
+  "age-progression": "Applying bi-directional age progression model...",
+  fetching: "Matching against registered cases...",
+  "extracting-frames": "Extracting frames from video...",
+  "analyzing-frames": "Analyzing frames with face recognition...",
+};
+
+const extractFramesFromVideo = async (
+  file: File,
+  numFrames = 20,
+): Promise<string[]> => {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    const url = URL.createObjectURL(file);
+    video.src = url;
+    video.muted = true;
+    const frames: string[] = [];
+    video.addEventListener("loadedmetadata", async () => {
+      const duration = video.duration;
+      const canvas = document.createElement("canvas");
+      canvas.width = 640;
+      canvas.height = 480;
+      const ctx = canvas.getContext("2d")!;
+
+      // Skip first/last 5% of duration
+      const startTime = duration * 0.05;
+      const endTime = duration * 0.95;
+      const usableDuration = endTime - startTime;
+
+      let prevHist: number[] | null = null;
+      const collected: string[] = [];
+
+      for (let i = 0; i < numFrames * 2 && collected.length < numFrames; i++) {
+        const time = startTime + (usableDuration / (numFrames * 2 - 1)) * i;
+        if (time > endTime) break;
+        video.currentTime = time;
+        await new Promise((r) =>
+          video.addEventListener("seeked", r, { once: true }),
+        );
+        ctx.drawImage(video, 0, 0, 640, 480);
+        const frameDataUrl = canvas.toDataURL("image/jpeg", 0.9);
+
+        // Skip near-identical frames (histogram diff < 0.05)
+        const imgData = ctx.getImageData(0, 0, 640, 480);
+        const hist = extractHistogram(imgData);
+        if (prevHist !== null) {
+          const diff = hist.reduce(
+            (sum, v, idx) => sum + Math.abs(v - prevHist![idx]),
+            0,
+          );
+          if (diff < 0.05) continue;
+        }
+        prevHist = hist;
+        collected.push(frameDataUrl);
+      }
+
+      // Ensure we always get at least some frames even if all were skipped
+      if (collected.length === 0) {
+        for (let i = 0; i < Math.min(numFrames, 5); i++) {
+          const time = startTime + (usableDuration / 4) * i;
+          video.currentTime = time;
+          await new Promise((r) =>
+            video.addEventListener("seeked", r, { once: true }),
+          );
+          ctx.drawImage(video, 0, 0, 640, 480);
+          collected.push(canvas.toDataURL("image/jpeg", 0.9));
+        }
+      }
+
+      frames.push(...collected);
+      URL.revokeObjectURL(url);
+      resolve(frames);
+    });
+    video.load();
+  });
+};
+
+export default function SearchPage() {
+  const { data: allCases } = useGetAllCases();
+  const { mutateAsync: markFound } = useUpdateStatusToFound();
+  const { mutateAsync: addAlert } = useAddAlert();
+
+  const [photo, setPhoto] = useState<File | null>(null);
+  const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [phase, setPhase] = useState<SearchPhase>("idle");
+  const [progress, setProgress] = useState(0);
+  const [results, setResults] = useState<MatchResult[]>([]);
+  const [markingFound, setMarkingFound] = useState<string | null>(null);
+  const [ageProgressedUrl, setAgeProgressedUrl] = useState<string | null>(null);
+  const [alertMessage, setAlertMessage] = useState<string | null>(null);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Video upload state
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [videoFrameCount, setVideoFrameCount] = useState(0);
+  const [isVideoDragging, setIsVideoDragging] = useState(false);
+  const videoInputRef = useRef<HTMLInputElement>(null);
+  const [videoAnalysisMessage, setVideoAnalysisMessage] = useState<
+    string | null
+  >(null);
+
+  // Load face-api models in background on mount
+  useEffect(() => {
+    ensureModelsLoaded()
+      .then(() => {
+        setModelsLoaded(areModelsLoaded());
+      })
+      .catch(() => {
+        // Silent fail -- will fall back to histogram matching
+      });
+  }, []);
+
+  // Face detection state
+  const [faceVariance, setFaceVariance] = useState(0);
+  const [faceDetectedByApi, setFaceDetectedByApi] = useState(false);
+  const faceRafRef = useRef<number | null>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const camera = useCamera({ facingMode: "user" });
+
+  // Variance-based face detection loop (always runs as fallback)
+  const runFaceDetectionLoop = useCallback(() => {
+    if (!camera.videoRef.current || !camera.isActive) return;
+
+    const video = camera.videoRef.current;
+
+    if (!offscreenCanvasRef.current) {
+      offscreenCanvasRef.current = document.createElement("canvas");
+      offscreenCanvasRef.current.width = 64;
+      offscreenCanvasRef.current.height = 64;
+    }
+
+    const canvas = offscreenCanvasRef.current;
+    const ctx = canvas.getContext("2d");
+    if (!ctx || video.readyState < 2) {
+      faceRafRef.current = requestAnimationFrame(runFaceDetectionLoop);
+      return;
+    }
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const cx = vw * 0.25;
+    const cy = vh * 0.15;
+    const cw = vw * 0.5;
+    const ch = vh * 0.7;
+
+    ctx.drawImage(video, cx, cy, cw, ch, 0, 0, 64, 64);
+    const imageData = ctx.getImageData(0, 0, 64, 64);
+    const variance = computeFrameVariance(imageData);
+    setFaceVariance(variance);
+
+    faceRafRef.current = requestAnimationFrame(runFaceDetectionLoop);
+  }, [camera.isActive, camera.videoRef]);
+
+  useEffect(() => {
+    if (camera.isActive) {
+      faceRafRef.current = requestAnimationFrame(runFaceDetectionLoop);
+    } else {
+      if (faceRafRef.current !== null) {
+        cancelAnimationFrame(faceRafRef.current);
+        faceRafRef.current = null;
+      }
+      setFaceVariance(0);
+      setFaceDetectedByApi(false);
+    }
+    return () => {
+      if (faceRafRef.current !== null) {
+        cancelAnimationFrame(faceRafRef.current);
+        faceRafRef.current = null;
+      }
+    };
+  }, [camera.isActive, runFaceDetectionLoop]);
+
+  // face-api.js based face detection every 800ms when camera is active
+  useEffect(() => {
+    if (!camera.isActive || !modelsLoaded) return;
+
+    const interval = setInterval(async () => {
+      if (!camera.videoRef.current || camera.videoRef.current.readyState < 2)
+        return;
+      const video = camera.videoRef.current;
+
+      // Capture a frame to canvas
+      const captureCanvas = document.createElement("canvas");
+      captureCanvas.width = video.videoWidth || 320;
+      captureCanvas.height = video.videoHeight || 240;
+      const ctx = captureCanvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+
+      const img = new Image();
+      img.src = captureCanvas.toDataURL("image/jpeg", 0.7);
+      await new Promise<void>((r) => {
+        img.onload = () => r();
+      });
+
+      const detected = await detectFaceInImage(img);
+      setFaceDetectedByApi(detected);
+    }, 800);
+
+    return () => clearInterval(interval);
+  }, [camera.isActive, modelsLoaded, camera.videoRef]);
+
+  // Combine variance + API detection for final status
+  const faceStatus: "detected" | "partial" | "none" = modelsLoaded
+    ? faceDetectedByApi
+      ? "detected"
+      : faceVariance > 300
+        ? "partial"
+        : "none"
+    : faceVariance > 800
+      ? "detected"
+      : faceVariance > 300
+        ? "partial"
+        : "none";
+
+  const handlePhoto = (file: File) => {
+    setPhoto(file);
+    setPhotoPreview(URL.createObjectURL(file));
+    setResults([]);
+    setPhase("idle");
+    setProgress(0);
+    setAgeProgressedUrl(null);
+    setAlertMessage(null);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file?.type.startsWith("image/")) handlePhoto(file);
+  };
+
+  const runSearch = async (overrideFile?: File) => {
+    const activePhoto = overrideFile ?? photo;
+    if (!activePhoto) return;
+
+    setResults([]);
+    setAgeProgressedUrl(null);
+    setAlertMessage(null);
+    setPhase("loading-models");
+    setProgress(5);
+
+    await ensureModelsLoaded().catch(() => {});
+    setModelsLoaded(areModelsLoaded());
+    setProgress(15);
+
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(activePhoto);
+    });
+
+    setPhase("preprocessing");
+    setProgress(25);
+    await loadImageToCanvas(dataUrl);
+
+    setPhase("analyzing");
+    setProgress(35);
+
+    setPhase("age-progression");
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    setProgress(55);
+
+    setPhase("fetching");
+
+    const cases = allCases ?? [];
+    const casesWithPhotos = cases.filter(
+      (c) => c.photoId && c.photoId.trim() !== "",
+    );
+    const casesWithoutPhotos = cases.filter(
+      (c) => !c.photoId || c.photoId.trim() === "",
+    );
+
+    let agedUrl: string | null = null;
+
+    const scoredWithPhotos: MatchResult[] = await Promise.all(
+      casesWithPhotos.map(async (record) => {
+        const score = await computeMatchScore(
+          dataUrl,
+          record.photoId,
+          (url) => {
+            if (!agedUrl) {
+              agedUrl = url;
+              setAgeProgressedUrl(url);
+            }
+          },
+        );
+        return { record, score };
+      }),
+    );
+
+    const scoredWithoutPhotos: MatchResult[] = casesWithoutPhotos.map(
+      (record) => ({ record, score: 0 }),
+    );
+
+    const allScored = [...scoredWithPhotos, ...scoredWithoutPhotos];
+    allScored.sort((a, b) => b.score - a.score);
+
+    // Always show the single best-scored result (even if score is low/zero)
+    const withPhotos = allScored.filter(
+      (r) => r.record.photoId && r.record.photoId.trim() !== "",
+    );
+    const topResult = withPhotos.length > 0 ? [withPhotos[0]] : [];
+
+    setProgress(100);
+    setPhase("done");
+    setResults(topResult);
+
+    if (topResult.length > 0) {
+      const match = topResult[0];
+      const msg = `Match found for ${match.record.name} (Age: ${Number(match.record.age)}, Last seen: ${match.record.lastLocation}). Please contact authorities immediately.`;
+      setAlertMessage(`Alert sent to ${match.record.contactNumber}: ${msg}`);
+      try {
+        await addAlert({
+          contactNumber: match.record.contactNumber,
+          message: msg,
+        });
+      } catch {
+        // best-effort
+      }
+    }
+  };
+
+  const runVideoSearch = async () => {
+    if (!videoFile) return;
+
+    setResults([]);
+    setAgeProgressedUrl(null);
+    setAlertMessage(null);
+    setVideoAnalysisMessage(null);
+    setPhase("loading-models");
+    setProgress(5);
+
+    await ensureModelsLoaded().catch(() => {});
+    setModelsLoaded(areModelsLoaded());
+    setProgress(10);
+
+    setPhase("extracting-frames");
+    setVideoAnalysisMessage("Extracting frames from video...");
+    const frames = await extractFramesFromVideo(videoFile, 15);
+    setVideoFrameCount(frames.length);
+    setProgress(25);
+
+    setPhase("analyzing-frames");
+
+    const cases = allCases ?? [];
+    const casesWithPhotos = cases.filter(
+      (c) => c.photoId && c.photoId.trim() !== "",
+    );
+    const casesWithoutPhotos = cases.filter(
+      (c) => !c.photoId || c.photoId.trim() === "",
+    );
+
+    // For each case, find the best score across all frames
+    const caseScores: Map<string, number> = new Map();
+
+    for (let fi = 0; fi < frames.length; fi++) {
+      const frameDataUrl = frames[fi];
+      const faceMsg = `Analyzing frame ${fi + 1} of ${frames.length}...`;
+      setVideoAnalysisMessage(faceMsg);
+      setProgress(25 + Math.round(((fi + 1) / frames.length) * 65));
+
+      await Promise.all(
+        casesWithPhotos.map(async (record) => {
+          const score = await computeMatchScore(frameDataUrl, record.photoId);
+          const caseKey = String(record.name) + String(record.age);
+          const existing = caseScores.get(caseKey) ?? 0;
+          if (score > existing) {
+            caseScores.set(caseKey, score);
+          }
+        }),
+      );
+    }
+
+    const scoredWithPhotos: MatchResult[] = casesWithPhotos.map((record) => ({
+      record,
+      score: caseScores.get(String(record.name) + String(record.age)) ?? 0,
+    }));
+
+    const scoredWithoutPhotos: MatchResult[] = casesWithoutPhotos.map(
+      (record) => ({ record, score: 0 }),
+    );
+
+    const allScored = [...scoredWithPhotos, ...scoredWithoutPhotos];
+    allScored.sort((a, b) => b.score - a.score);
+
+    // Always show the single best-scored result (even if score is low/zero)
+    const withPhotos = allScored.filter(
+      (r) => r.record.photoId && r.record.photoId.trim() !== "",
+    );
+    const topResult = withPhotos.length > 0 ? [withPhotos[0]] : [];
+
+    setProgress(100);
+    setPhase("done");
+    setResults(topResult);
+    setVideoAnalysisMessage(null);
+
+    if (topResult.length > 0) {
+      const match = topResult[0];
+      const msg = `Match found for ${match.record.name} (Age: ${Number(match.record.age)}, Last seen: ${match.record.lastLocation}). Please contact authorities immediately.`;
+      setAlertMessage(`Alert sent to ${match.record.contactNumber}: ${msg}`);
+      try {
+        await addAlert({
+          contactNumber: match.record.contactNumber,
+          message: msg,
+        });
+      } catch {
+        // best-effort
+      }
+    }
+  };
+
+  const handleCaptureAndSearch = async () => {
+    if (!camera.videoRef.current || !camera.isActive) return;
+    clearSearchFaceCache();
+    const video = camera.videoRef.current;
+
+    const capturedFrames: File[] = [];
+    for (let i = 0; i < 5; i++) {
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+      const cap = document.createElement("canvas");
+      cap.width = w;
+      cap.height = h;
+      const ctx = cap.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, w, h);
+        const blob = await new Promise<Blob | null>((r) =>
+          cap.toBlob(r, "image/jpeg", 0.92),
+        );
+        if (blob)
+          capturedFrames.push(
+            new File([blob], `frame${i}.jpg`, { type: "image/jpeg" }),
+          );
+      }
+      if (i < 4) await new Promise((r) => setTimeout(r, 100));
+    }
+
+    if (capturedFrames.length === 0) return;
+
+    // Pick the best frame: first one with a detected face
+    let bestFrame = capturedFrames[Math.floor(capturedFrames.length / 2)];
+    for (const frame of capturedFrames) {
+      const dataUrl = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.readAsDataURL(frame);
+      });
+      const img = new Image();
+      img.src = dataUrl;
+      await new Promise<void>((r) => {
+        img.onload = () => r();
+      });
+      const hasFace = await detectFaceInImage(img);
+      if (hasFace) {
+        bestFrame = frame;
+        break;
+      }
+    }
+
+    handlePhoto(bestFrame);
+    await runSearch(bestFrame);
+  };
+  const handleTabChange = (value: string) => {
+    if (value !== "camera" && camera.isActive) {
+      camera.stopCamera();
+    }
+    if (value !== "video") {
+      setVideoFile(null);
+      setVideoFrameCount(0);
+      setVideoAnalysisMessage(null);
+    }
+  };
+
+  const handleMarkFound = async (contactNumber: string) => {
+    setMarkingFound(contactNumber);
+    try {
+      await markFound(contactNumber);
+    } finally {
+      setMarkingFound(null);
+    }
+  };
+
+  const isSearching =
+    phase === "loading-models" ||
+    phase === "preprocessing" ||
+    phase === "analyzing" ||
+    phase === "age-progression" ||
+    phase === "fetching" ||
+    phase === "extracting-frames" ||
+    phase === "analyzing-frames";
+  const topMatch = results[0];
+  const hasRegisteredCasesWithPhotos = (allCases ?? []).some(
+    (c) => c.photoId && c.photoId.trim() !== "",
+  );
+
+  return (
+    <div className="min-h-screen bg-background flex flex-col">
+      <Navbar />
+
+      <div className="bg-card border-b border-border">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          <h1 className="text-2xl font-bold text-foreground">
+            Search by Photo
+          </h1>
+          <p className="text-muted-foreground text-sm mt-1">
+            Upload a photo, video, or use live camera to match against
+            registered missing children using CNN face recognition with age
+            progression
+          </p>
+        </div>
+      </div>
+
+      <main className="flex-1 max-w-4xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+        <Tabs defaultValue="photo" onValueChange={handleTabChange}>
+          <TabsList className="mb-4">
+            <TabsTrigger value="photo" data-ocid="search.tab">
+              <Upload className="w-4 h-4 mr-2" />
+              Photo Upload
+            </TabsTrigger>
+            <TabsTrigger value="video" data-ocid="search.tab">
+              <Video className="w-4 h-4 mr-2" />
+              Upload Video
+            </TabsTrigger>
+            <TabsTrigger value="camera" data-ocid="search.tab">
+              <Camera className="w-4 h-4 mr-2" />
+              Live Camera
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="photo">
+            <div className="bg-card rounded-xl border border-border shadow-card p-6">
+              <h2 className="text-base font-semibold text-foreground mb-4">
+                Upload Search Photo
+              </h2>
+
+              {photoPreview ? (
+                <div className="flex items-start gap-6">
+                  <div className="relative shrink-0">
+                    <img
+                      src={photoPreview}
+                      alt="Selected for search"
+                      className="w-32 h-32 rounded-xl object-cover border-2 border-secondary shadow"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPhoto(null);
+                        setPhotoPreview(null);
+                        setResults([]);
+                        setPhase("idle");
+                        setAgeProgressedUrl(null);
+                        setAlertMessage(null);
+                      }}
+                      className="absolute -top-2 -right-2 w-6 h-6 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center"
+                      data-ocid="search.close_button"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                  <div className="flex-1">
+                    <p className="font-medium text-foreground">{photo?.name}</p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {photo ? `${(photo.size / 1024).toFixed(1)} KB` : ""}
+                    </p>
+                    <Button
+                      onClick={() => runSearch()}
+                      disabled={isSearching}
+                      className="mt-4 bg-primary text-primary-foreground hover:bg-primary/90 gap-2"
+                      data-ocid="search.primary_button"
+                    >
+                      {isSearching ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />{" "}
+                          Analyzing...
+                        </>
+                      ) : (
+                        <>
+                          <Search className="w-4 h-4" /> Search for Match
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  data-ocid="search.dropzone"
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDragging(true);
+                  }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={handleDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                  className={`w-full border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-colors ${
+                    isDragging
+                      ? "border-secondary bg-secondary/5"
+                      : "border-border hover:border-secondary hover:bg-secondary/5"
+                  }`}
+                >
+                  <Upload className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
+                  <p className="font-medium text-foreground">
+                    Drop a photo here or click to upload
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    All image formats supported (JPG, PNG, WebP, HEIC, etc.)
+                  </p>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    data-ocid="search.upload_button"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        clearSearchFaceCache();
+                        handlePhoto(file);
+                      }
+                    }}
+                  />
+                </button>
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent value="video">
+            <div className="bg-card rounded-xl border border-border shadow-card p-6">
+              <h2 className="text-base font-semibold text-foreground mb-1">
+                Upload Video for Face Detection
+              </h2>
+              <p className="text-xs text-muted-foreground mb-4">
+                Upload a video file to extract frames and cross-check faces
+                against registered cases
+              </p>
+
+              {videoFile ? (
+                <div className="flex items-start gap-6">
+                  <div className="relative shrink-0 w-32 h-32 rounded-xl bg-muted border-2 border-secondary flex flex-col items-center justify-center gap-2">
+                    <Video className="w-8 h-8 text-secondary" />
+                    <span className="text-xs text-muted-foreground text-center px-2 leading-tight line-clamp-2">
+                      {videoFile.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setVideoFile(null);
+                        setVideoFrameCount(0);
+                        setResults([]);
+                        setPhase("idle");
+                        setAlertMessage(null);
+                        setVideoAnalysisMessage(null);
+                      }}
+                      className="absolute -top-2 -right-2 w-6 h-6 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center"
+                      data-ocid="search.close_button"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                  <div className="flex-1">
+                    <p className="font-medium text-foreground truncate">
+                      {videoFile.name}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {(videoFile.size / (1024 * 1024)).toFixed(1)} MB
+                    </p>
+                    {videoFrameCount > 0 && (
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {videoFrameCount} frames extracted
+                      </p>
+                    )}
+                    {videoAnalysisMessage && (
+                      <p className="text-xs text-secondary mt-0.5 font-medium">
+                        {videoAnalysisMessage}
+                      </p>
+                    )}
+                    <Button
+                      onClick={runVideoSearch}
+                      disabled={isSearching}
+                      className="mt-4 bg-primary text-primary-foreground hover:bg-primary/90 gap-2"
+                      data-ocid="search.primary_button"
+                    >
+                      {isSearching ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Analyzing...
+                        </>
+                      ) : (
+                        <>
+                          <Search className="w-4 h-4" /> Analyze Video
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  data-ocid="search.dropzone"
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsVideoDragging(true);
+                  }}
+                  onDragLeave={() => setIsVideoDragging(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setIsVideoDragging(false);
+                    const file = e.dataTransfer.files[0];
+                    if (file?.type.startsWith("video/")) {
+                      setVideoFile(file);
+                      setResults([]);
+                      setPhase("idle");
+                      setAlertMessage(null);
+                    }
+                  }}
+                  onClick={() => videoInputRef.current?.click()}
+                  className={`w-full border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-colors ${
+                    isVideoDragging
+                      ? "border-secondary bg-secondary/5"
+                      : "border-border hover:border-secondary hover:bg-secondary/5"
+                  }`}
+                >
+                  <Video className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
+                  <p className="font-medium text-foreground">
+                    Drop a video here or click to upload
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Supported formats: MP4, MOV, WebM
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Up to 15 frames extracted and analyzed for face matches
+                  </p>
+                  <input
+                    ref={videoInputRef}
+                    type="file"
+                    accept="video/mp4,video/quicktime,video/webm,video/*"
+                    className="hidden"
+                    data-ocid="search.upload_button"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        clearSearchFaceCache();
+                        setVideoFile(file);
+                        setResults([]);
+                        setPhase("idle");
+                        setAlertMessage(null);
+                      }
+                    }}
+                  />
+                </button>
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent value="camera">
+            <div className="bg-card rounded-xl border border-border shadow-card p-6">
+              <h2 className="text-base font-semibold text-foreground mb-4">
+                Live Face Detection
+              </h2>
+
+              <div className="relative aspect-video w-full rounded-xl overflow-hidden bg-black mb-4">
+                <video
+                  ref={camera.videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-full object-cover"
+                  style={{ transform: "scaleX(-1)" }}
+                />
+                <canvas ref={camera.canvasRef} className="hidden" />
+
+                {camera.isActive && (
+                  <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    <div
+                      className={`w-48 h-56 border-2 rounded-2xl flex items-end justify-center pb-3 transition-colors duration-300 ${
+                        faceStatus === "detected"
+                          ? "border-green-400 animate-pulse shadow-[0_0_16px_2px_rgba(74,222,128,0.4)]"
+                          : faceStatus === "partial"
+                            ? "border-yellow-400/70 border-dashed"
+                            : "border-white/40 border-dashed"
+                      }`}
+                    >
+                      <span
+                        className={`text-xs font-medium px-2 py-1 rounded-full ${
+                          faceStatus === "detected"
+                            ? "bg-green-500/80 text-white"
+                            : faceStatus === "partial"
+                              ? "bg-yellow-500/70 text-white"
+                              : "text-white/80 bg-black/40"
+                        }`}
+                      >
+                        {faceStatus === "detected"
+                          ? "Face Detected"
+                          : faceStatus === "partial"
+                            ? "Searching for face..."
+                            : "Position face in frame"}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {!camera.isActive && !camera.isLoading && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
+                    <Camera className="w-12 h-12 text-white/30" />
+                    <p className="text-white/50 text-sm">Camera not started</p>
+                  </div>
+                )}
+
+                {camera.isLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <Loader2 className="w-8 h-8 text-white/60 animate-spin" />
+                  </div>
+                )}
+              </div>
+
+              {camera.isActive && (
+                <div className="mb-4 p-3 rounded-lg bg-muted/40 border border-border">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      {faceStatus === "detected" ? (
+                        <Eye className="w-4 h-4 text-green-500" />
+                      ) : (
+                        <EyeOff className="w-4 h-4 text-muted-foreground" />
+                      )}
+                      <span className="text-sm font-medium text-foreground">
+                        Face Detection
+                        {modelsLoaded && (
+                          <span className="ml-1 text-xs text-muted-foreground font-normal">
+                            (CNN active)
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <span
+                      className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                        faceStatus === "detected"
+                          ? "bg-green-500/15 text-green-600"
+                          : faceStatus === "partial"
+                            ? "bg-yellow-500/15 text-yellow-600"
+                            : "bg-muted text-muted-foreground"
+                      }`}
+                    >
+                      {faceStatus === "detected"
+                        ? "Face Detected"
+                        : faceStatus === "partial"
+                          ? "Searching..."
+                          : "No Face"}
+                    </span>
+                  </div>
+                  <div className="w-full h-2 rounded-full bg-muted overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-200 ${
+                        faceStatus === "detected"
+                          ? "bg-green-500"
+                          : faceStatus === "partial"
+                            ? "bg-yellow-500"
+                            : "bg-muted-foreground/30"
+                      }`}
+                      style={{
+                        width: `${Math.min(100, (faceVariance / 1200) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {camera.error?.type === "permission" && (
+                <div
+                  className="bg-card border border-destructive/30 rounded-xl p-6 space-y-4 mb-4"
+                  data-ocid="search.error_state"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center shrink-0">
+                      <ShieldAlert className="w-5 h-5 text-destructive" />
+                    </div>
+                    <div>
+                      <h3 className="font-semibold text-foreground">
+                        Camera Permission Required
+                      </h3>
+                      <p className="text-sm text-muted-foreground">
+                        Allow camera access to use face detection
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <p className="text-sm font-medium text-foreground">
+                      How to enable camera access:
+                    </p>
+                    <ol className="space-y-2 text-sm text-muted-foreground">
+                      <li className="flex gap-2">
+                        <span className="font-medium text-foreground shrink-0">
+                          1.
+                        </span>
+                        Click the camera or lock icon in your browser&apos;s
+                        address bar
+                      </li>
+                      <li className="flex gap-2">
+                        <span className="font-medium text-foreground shrink-0">
+                          2.
+                        </span>
+                        Find &quot;Camera&quot; in the permissions list
+                      </li>
+                      <li className="flex gap-2">
+                        <span className="font-medium text-foreground shrink-0">
+                          3.
+                        </span>
+                        Change it from &quot;Blocked&quot; to &quot;Allow&quot;
+                      </li>
+                      <li className="flex gap-2">
+                        <span className="font-medium text-foreground shrink-0">
+                          4.
+                        </span>
+                        Click &quot;Try Again&quot; below to restart the camera
+                      </li>
+                    </ol>
+                  </div>
+                  <div className="bg-muted/50 rounded-lg p-3 text-xs text-muted-foreground space-y-1">
+                    <p>
+                      <strong>Chrome/Edge:</strong> Click the lock icon → Site
+                      settings → Camera → Allow
+                    </p>
+                    <p>
+                      <strong>Firefox:</strong> Click the shield icon →
+                      Permissions → Camera → Allow
+                    </p>
+                    <p>
+                      <strong>Safari:</strong> Safari menu → Settings for this
+                      website → Camera → Allow
+                    </p>
+                  </div>
+                  <Button
+                    onClick={() => camera.retry()}
+                    className="gap-2"
+                    data-ocid="search.primary_button"
+                  >
+                    <Camera className="w-4 h-4" />
+                    Try Again
+                  </Button>
+                </div>
+              )}
+
+              {camera.error && camera.error.type !== "permission" && (
+                <Alert
+                  className="mb-4 border-destructive/40 bg-destructive/5"
+                  data-ocid="search.error_state"
+                >
+                  <AlertTriangle className="h-4 w-4 text-destructive" />
+                  <AlertDescription className="text-destructive">
+                    {camera.error.message}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <div className="flex gap-3">
+                {!camera.isActive ? (
+                  <Button
+                    onClick={() => camera.startCamera()}
+                    disabled={camera.isLoading}
+                    className="gap-2"
+                    data-ocid="search.primary_button"
+                  >
+                    {camera.isLoading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Camera className="w-4 h-4" />
+                    )}
+                    Start Camera
+                  </Button>
+                ) : (
+                  <>
+                    <Button
+                      onClick={handleCaptureAndSearch}
+                      disabled={isSearching}
+                      className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
+                      data-ocid="search.primary_button"
+                    >
+                      {isSearching ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Search className="w-4 h-4" />
+                      )}
+                      Capture & Search
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => camera.stopCamera()}
+                      className="gap-2"
+                      data-ocid="search.secondary_button"
+                    >
+                      <X className="w-4 h-4" />
+                      Stop Camera
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => camera.switchCamera()}
+                      disabled={camera.isLoading}
+                      className="gap-2"
+                      title={
+                        camera.currentFacingMode === "user"
+                          ? "Switch to back camera"
+                          : "Switch to front camera"
+                      }
+                    >
+                      {camera.isLoading ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <SwitchCamera className="w-4 h-4" />
+                      )}
+                      {camera.currentFacingMode === "user"
+                        ? "Back Camera"
+                        : "Front Camera"}
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
+          </TabsContent>
+        </Tabs>
+
+        <AnimatePresence>
+          {isSearching && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              className="bg-card rounded-xl border border-border shadow-card p-6"
+              data-ocid="search.loading_state"
+            >
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-8 h-8 rounded-full bg-secondary/20 flex items-center justify-center">
+                  <Loader2 className="w-4 h-4 text-secondary animate-spin" />
+                </div>
+                <p className="font-medium text-foreground">
+                  {videoAnalysisMessage ??
+                    PHASE_MESSAGES[phase] ??
+                    "Processing..."}
+                </p>
+              </div>
+              <Progress value={progress} className="h-2" />
+              <p className="text-xs text-muted-foreground mt-2">
+                {progress}% complete
+              </p>
+
+              {phase === "age-progression" && photoPreview && (
+                <motion.div
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="mt-4 flex items-center gap-4"
+                >
+                  <div className="flex flex-col items-center gap-1">
+                    <img
+                      src={photoPreview}
+                      alt="Original"
+                      className="w-20 h-20 rounded-lg object-cover border border-border"
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      Original
+                    </span>
+                  </div>
+                  <div className="flex flex-col items-center gap-1 text-muted-foreground">
+                    <div className="flex items-center gap-1">
+                      <div className="w-6 h-px bg-border" />
+                      <span className="text-xs">Age ±</span>
+                      <div className="w-6 h-px bg-border" />
+                    </div>
+                  </div>
+                  <div className="flex flex-col items-center gap-1">
+                    {ageProgressedUrl ? (
+                      <img
+                        src={ageProgressedUrl}
+                        alt="Age Progressed"
+                        className="w-20 h-20 rounded-lg object-cover border border-secondary/60"
+                      />
+                    ) : (
+                      <div className="w-20 h-20 rounded-lg bg-muted flex items-center justify-center border border-border">
+                        <Loader2 className="w-5 h-5 text-muted-foreground animate-spin" />
+                      </div>
+                    )}
+                    <span className="text-xs text-muted-foreground">
+                      Age Progressed
+                    </span>
+                  </div>
+                </motion.div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {alertMessage && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+            >
+              <Alert
+                className="border-destructive/40 bg-destructive/5"
+                data-ocid="search.toast"
+              >
+                <AlertTriangle className="h-4 w-4 text-destructive" />
+                <AlertDescription className="text-destructive font-medium">
+                  {alertMessage}
+                </AlertDescription>
+              </Alert>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {phase === "done" && results.length > 0 && !modelsLoaded && (
+            <motion.div
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400"
+              data-ocid="search.error_state"
+            >
+              ⚠️ Face detection models could not load — results are based on
+              basic color matching only and may be less accurate. Check your
+              internet connection and try again.
+            </motion.div>
+          )}
+
+          {phase === "done" && results.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-4"
+            >
+              {topMatch && topMatch.score >= 65 && (
+                <Alert
+                  className="border-destructive/40 bg-destructive/5"
+                  data-ocid="search.toast"
+                >
+                  <AlertTriangle className="h-4 w-4 text-destructive" />
+                  <AlertDescription>
+                    <strong className="text-destructive">MATCH FOUND!</strong>{" "}
+                    Contact authorities immediately and alert the registered
+                    number:{" "}
+                    <strong className="text-destructive">
+                      {topMatch.record.contactNumber}
+                    </strong>
+                    . Best match: <strong>{topMatch.record.name}</strong>
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <h2 className="text-base font-semibold text-foreground">
+                Best Match Found
+              </h2>
+
+              {topMatch && topMatch.score < 40 && (
+                <Alert className="border-blue-500/30 bg-blue-500/5">
+                  <AlertDescription className="text-blue-700 dark:text-blue-400">
+                    <strong>Tip:</strong> For best matching accuracy, use a
+                    clear frontal photo with good lighting.
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {results.map((result) => {
+                return (
+                  <motion.div
+                    key={result.record.contactNumber}
+                    initial={{ opacity: 0, scale: 0.97 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className={
+                      result.score >= 65
+                        ? "rounded-xl border border-success/40 bg-success/5 shadow-card p-6"
+                        : result.score >= 40
+                          ? "rounded-xl border border-amber-500/40 bg-amber-500/5 shadow-card p-6"
+                          : "rounded-xl border border-muted bg-muted/30 shadow-card p-6"
+                    }
+                    data-ocid="search.item.1"
+                  >
+                    <div className="flex items-start gap-5">
+                      {/* Large prominent photo */}
+                      <div
+                        className={
+                          result.score >= 65
+                            ? "relative shrink-0 w-40 h-40 rounded-xl overflow-hidden bg-muted border-2 border-success/40 shadow"
+                            : result.score >= 40
+                              ? "relative shrink-0 w-40 h-40 rounded-xl overflow-hidden bg-muted border-2 border-amber-500/40 shadow"
+                              : "relative shrink-0 w-40 h-40 rounded-xl overflow-hidden bg-muted border-2 border-muted shadow"
+                        }
+                      >
+                        {result.record.photoId ? (
+                          <img
+                            src={result.record.photoId}
+                            alt={result.record.name}
+                            className="w-full h-full object-cover"
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).style.display =
+                                "none";
+                            }}
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center">
+                            <span className="text-3xl font-bold text-muted-foreground">
+                              {result.record.name.charAt(0)}
+                            </span>
+                          </div>
+                        )}
+                        <div
+                          className={
+                            result.score >= 65
+                              ? "absolute bottom-0 left-0 right-0 bg-success/90 text-white text-[11px] font-bold text-center py-1.5 tracking-wide"
+                              : result.score >= 40
+                                ? "absolute bottom-0 left-0 right-0 bg-amber-500/90 text-white text-[11px] font-bold text-center py-1.5 tracking-wide"
+                                : "absolute bottom-0 left-0 right-0 bg-muted-foreground/70 text-white text-[11px] font-bold text-center py-1.5 tracking-wide"
+                          }
+                        >
+                          {result.score >= 65
+                            ? "✓ MATCH FOUND"
+                            : result.score >= 40
+                              ? "⚠ POSSIBLE MATCH"
+                              : result.score >= 1
+                                ? "~ LOW SIMILARITY"
+                                : "○ CLOSEST VISUAL MATCH"}
+                        </div>
+                      </div>
+
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="font-bold text-lg text-foreground">
+                                {result.record.name}
+                              </p>
+                              <span
+                                className={
+                                  result.score >= 65
+                                    ? "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-success/15 text-success"
+                                    : result.score >= 40
+                                      ? "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/15 text-amber-600"
+                                      : "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-muted text-muted-foreground"
+                                }
+                              >
+                                {result.score >= 65
+                                  ? "High Confidence Match"
+                                  : result.score >= 40
+                                    ? "Possible Match"
+                                    : result.score >= 1
+                                      ? "Low Similarity"
+                                      : "Closest Visual Match"}
+                              </span>
+                            </div>
+                            <p className="text-xs text-muted-foreground">
+                              Age {Number(result.record.age)} &bull;{" "}
+                              {result.record.lastLocation}
+                            </p>
+                            <p className="text-xs text-muted-foreground mt-0.5">
+                              Contact:{" "}
+                              <strong>{result.record.contactNumber}</strong>
+                            </p>
+                            {result.record.lastSeenPlace && (
+                              <p className="text-xs text-muted-foreground mt-0.5">
+                                Last seen:{" "}
+                                <strong>{result.record.lastSeenPlace}</strong>
+                              </p>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between mt-3">
+                          <div className="flex items-center gap-2">
+                            {result.record.status === Status.active ? (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
+                                Active
+                              </span>
+                            ) : result.record.status === Status.found ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
+                                <CheckCircle className="w-3 h-3" /> Found
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
+                                {String(result.record.status)}
+                              </span>
+                            )}
+                          </div>
+                          {result.record.status === Status.active && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() =>
+                                handleMarkFound(result.record.contactNumber)
+                              }
+                              disabled={
+                                markingFound === result.record.contactNumber
+                              }
+                              data-ocid="search.confirm_button"
+                              className="text-xs gap-1 border-success/40 text-success hover:bg-success/10"
+                            >
+                              {markingFound === result.record.contactNumber ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <CheckCircle className="w-3 h-3" />
+                              )}
+                              Mark as Found
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {phase === "done" && results.length === 0 && (
+          <div
+            className="bg-card rounded-xl border border-border shadow-card p-12 text-center"
+            data-ocid="search.empty_state"
+          >
+            <Search className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
+            <p className="font-medium text-foreground">
+              {hasRegisteredCasesWithPhotos
+                ? "No confident match found"
+                : "No registered cases with photos"}
+            </p>
+            <p className="text-sm text-muted-foreground mt-1">
+              {hasRegisteredCasesWithPhotos
+                ? "The face recognition system did not find a high-confidence match. Use a clear, well-lit frontal photo for best results."
+                : "Register missing children with photos first to enable face matching."}
+            </p>
+          </div>
+        )}
+      </main>
+
+      <footer className="bg-footer text-footer-foreground mt-auto">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          <p className="text-sm text-center">
+            &copy; {new Date().getFullYear()} Missing Child Finder. Built with
+            love using{" "}
+            <a
+              href={`https://caffeine.ai?utm_source=caffeine-footer&utm_medium=referral&utm_content=${encodeURIComponent(window.location.hostname)}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:opacity-80"
+            >
+              caffeine.ai
+            </a>
+          </p>
+        </div>
+      </footer>
+    </div>
+  );
+}
