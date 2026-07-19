@@ -11,6 +11,7 @@ import {
   Plus,
   Search,
   Users,
+  XCircle,
 } from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
@@ -20,6 +21,43 @@ import {
   useGetAllCases,
   useGetDashboardStats,
 } from "../hooks/useQueries";
+
+function StatusBadge({ status }: { status: unknown }) {
+  if (status === Status.active) {
+    return (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
+        Active
+      </span>
+    );
+  }
+  if (status === Status.underReview) {
+    return (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-warning/10 text-warning">
+        Under Review
+      </span>
+    );
+  }
+  if (status === Status.found) {
+    return (
+      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
+        Found
+      </span>
+    );
+  }
+  if (status === Status.closed) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
+        <XCircle className="w-3 h-3" />
+        Closed
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
+      Unknown
+    </span>
+  );
+}
 
 export default function DashboardPage() {
   const navigate = useNavigate();
@@ -210,7 +248,9 @@ export default function DashboardPage() {
                   {filteredCases.map((c, idx) => (
                     <tr
                       key={c.contactNumber}
-                      className="border-b border-border/50 hover:bg-muted/20 transition-colors"
+                      className={`border-b border-border/50 hover:bg-muted/20 transition-colors ${
+                        c.status === Status.closed ? "opacity-60" : ""
+                      }`}
                       data-ocid={`dashboard.item.${idx + 1}`}
                     >
                       <td className="px-6 py-4">
@@ -252,15 +292,7 @@ export default function DashboardPage() {
                         {c.lastSeenPlace}
                       </td>
                       <td className="px-4 py-4">
-                        {c.status === Status.active ? (
-                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
-                            Active
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
-                            Found
-                          </span>
-                        )}
+                        <StatusBadge status={c.status} />
                       </td>
                       <td className="px-6 py-4 text-right">
                         <Button

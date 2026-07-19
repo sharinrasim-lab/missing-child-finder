@@ -3,17 +3,17 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useActor, useInternetIdentity } from "@caffeineai/core-infrastructure";
 import { useNavigate } from "@tanstack/react-router";
 import { AlertCircle, Eye, EyeOff, Search, Shield } from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
-import { useActor } from "../hooks/useActor";
-import { useInternetIdentity } from "../hooks/useInternetIdentity";
+import { createActor } from "../backend";
 
 export default function LoginPage() {
   const navigate = useNavigate();
   const { login, loginStatus, identity } = useInternetIdentity();
-  const { actor } = useActor();
+  const { actor } = useActor(createActor);
 
   const [signInForm, setSignInForm] = useState({ username: "", password: "" });
   const [signUpForm, setSignUpForm] = useState({
@@ -52,8 +52,11 @@ export default function LoginPage() {
       await login();
       localStorage.setItem("sessionMode", "user");
       navigate({ to: "/dashboard" });
-    } catch (err: any) {
-      setError(err?.message || "Login failed. Please try again.");
+    } catch (err: unknown) {
+      setError(
+        (err as { message?: string })?.message ||
+          "Login failed. Please try again.",
+      );
     }
   };
 
@@ -83,8 +86,11 @@ export default function LoginPage() {
       }
       localStorage.setItem("sessionMode", "user");
       navigate({ to: "/dashboard" });
-    } catch (err: any) {
-      setError(err?.message || "Sign up failed. Please try again.");
+    } catch (err: unknown) {
+      setError(
+        (err as { message?: string })?.message ||
+          "Sign up failed. Please try again.",
+      );
     }
   };
 

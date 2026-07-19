@@ -11,6 +11,7 @@ import ProtectedRoute from "./components/ProtectedRoute";
 import AccountPage from "./pages/AccountPage";
 import AdminLoginPage from "./pages/AdminLoginPage";
 import AdminPage from "./pages/AdminPage";
+import ArchitectureDiagramPage from "./pages/ArchitectureDiagramPage";
 import DashboardPage from "./pages/DashboardPage";
 import LandingPage from "./pages/LandingPage";
 import LoginPage from "./pages/LoginPage";
@@ -86,6 +87,12 @@ const adminRoute = createRoute({
   component: AdminPage,
 });
 
+const architectureRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/architecture",
+  component: ArchitectureDiagramPage,
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
@@ -95,6 +102,7 @@ const routeTree = rootRoute.addChildren([
   searchRoute,
   accountRoute,
   adminRoute,
+  architectureRoute,
 ]);
 
 const router = createRouter({ routeTree });

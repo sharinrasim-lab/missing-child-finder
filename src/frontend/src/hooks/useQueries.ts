@@ -1,3 +1,4 @@
+import { useActor } from "@caffeineai/core-infrastructure";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type Alert,
@@ -6,11 +7,11 @@ import {
   Status,
   type UserProfile,
   UserRole,
+  createActor,
 } from "../backend";
-import { useActor } from "./useActor";
 
 export function useGetAllCases() {
-  const { actor, isFetching } = useActor();
+  const { actor, isFetching } = useActor(createActor);
   return useQuery<ChildRecord[]>({
     queryKey: ["cases"],
     queryFn: async () => {
@@ -23,7 +24,7 @@ export function useGetAllCases() {
 }
 
 export function useGetDashboardStats() {
-  const { actor, isFetching } = useActor();
+  const { actor, isFetching } = useActor(createActor);
   return useQuery<DashboardStats>({
     queryKey: ["dashboardStats"],
     queryFn: async () => {
@@ -36,7 +37,7 @@ export function useGetDashboardStats() {
 }
 
 export function useGetCallerProfile() {
-  const { actor, isFetching } = useActor();
+  const { actor, isFetching } = useActor(createActor);
   return useQuery<UserProfile | null>({
     queryKey: ["callerProfile"],
     queryFn: async () => {
@@ -48,7 +49,7 @@ export function useGetCallerProfile() {
 }
 
 export function useGetCallerRole() {
-  const { actor, isFetching } = useActor();
+  const { actor, isFetching } = useActor(createActor);
   return useQuery<UserRole>({
     queryKey: ["callerRole"],
     queryFn: async () => {
@@ -60,7 +61,7 @@ export function useGetCallerRole() {
 }
 
 export function useIsCallerAdmin() {
-  const { actor, isFetching } = useActor();
+  const { actor, isFetching } = useActor(createActor);
   return useQuery<boolean>({
     queryKey: ["isAdmin"],
     queryFn: async () => {
@@ -72,7 +73,7 @@ export function useIsCallerAdmin() {
 }
 
 export function useGetAlerts() {
-  const { actor, isFetching } = useActor();
+  const { actor, isFetching } = useActor(createActor);
   return useQuery<Alert[]>({
     queryKey: ["alerts"],
     queryFn: async () => {
@@ -89,7 +90,7 @@ export function useGetAlerts() {
 }
 
 export function useRegisterCase() {
-  const { actor } = useActor();
+  const { actor } = useActor(createActor);
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (record: ChildRecord) => {
@@ -129,7 +130,7 @@ export function useRegisterCase() {
 }
 
 export function useUpdateStatusToFound() {
-  const { actor } = useActor();
+  const { actor } = useActor(createActor);
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (contactNumber: string) => {
@@ -144,7 +145,7 @@ export function useUpdateStatusToFound() {
 }
 
 export function useUpdateCaseStatus() {
-  const { actor } = useActor();
+  const { actor } = useActor(createActor);
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({
@@ -165,7 +166,7 @@ export function useUpdateCaseStatus() {
 }
 
 export function useDeleteCase() {
-  const { actor } = useActor();
+  const { actor } = useActor(createActor);
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (contactNumber: string) => {
@@ -180,7 +181,7 @@ export function useDeleteCase() {
 }
 
 export function useAddAlert() {
-  const { actor } = useActor();
+  const { actor } = useActor(createActor);
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({

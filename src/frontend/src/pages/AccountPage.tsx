@@ -1,9 +1,9 @@
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useInternetIdentity } from "@caffeineai/core-infrastructure";
 import { Database, ShieldCheck, User } from "lucide-react";
 import { UserRole } from "../backend";
 import Navbar from "../components/Navbar";
-import { useInternetIdentity } from "../hooks/useInternetIdentity";
 import { useGetCallerProfile, useGetCallerRole } from "../hooks/useQueries";
 
 function roleBadge(role: UserRole | undefined) {

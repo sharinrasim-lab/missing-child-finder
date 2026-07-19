@@ -27,13 +27,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { useInternetIdentity } from "@caffeineai/core-infrastructure";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { Bell, LogOut, Search, Shield, Trash2 } from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
 import { Status } from "../backend";
-import { useInternetIdentity } from "../hooks/useInternetIdentity";
 import {
   useDeleteCase,
   useGetAlerts,

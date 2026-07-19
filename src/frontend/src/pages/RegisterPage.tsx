@@ -9,6 +9,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useActor, useInternetIdentity } from "@caffeineai/core-infrastructure";
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -21,12 +22,11 @@ import {
 import { AnimatePresence, motion } from "motion/react";
 import { useRef, useState } from "react";
 import { Status } from "../backend";
+import { createActor } from "../backend";
 import Navbar from "../components/Navbar";
-import { useActor } from "../hooks/useActor";
-import { useInternetIdentity } from "../hooks/useInternetIdentity";
 import { useRegisterCase } from "../hooks/useQueries";
 
-interface FormData {
+interface CaseFormData {
   name: string;
   age: string;
   lastLocation: string;
@@ -35,7 +35,7 @@ interface FormData {
   status: string;
 }
 
-const INITIAL_FORM: FormData = {
+const INITIAL_FORM: CaseFormData = {
   name: "",
   age: "",
   lastLocation: "",
@@ -98,17 +98,14 @@ async function compressImage(dataUrl: string): Promise<string> {
 
 export default function RegisterPage() {
   const navigate = useNavigate();
-  const {
-    actor,
-    isFetching: actorLoading,
-    isError: actorError,
-    refetch: refetchActor,
-  } = useActor();
+  const { actor, isFetching: actorLoading } = useActor(createActor);
+  const actorError = !actor && !actorLoading;
+  const refetchActor = () => window.location.reload();
   const { identity } = useInternetIdentity();
   const { mutateAsync: registerCase, isPending } = useRegisterCase();
 
-  const [form, setForm] = useState<FormData>(INITIAL_FORM);
-  const [errors, setErrors] = useState<Partial<FormData>>({});
+  const [form, setForm] = useState<CaseFormData>(INITIAL_FORM);
+  const [errors, setErrors] = useState<Partial<CaseFormData>>({});
   const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
   const [photoFileName, setPhotoFileName] = useState<string | null>(null);
   const [isCompressing, setIsCompressing] = useState(false);
@@ -120,7 +117,7 @@ export default function RegisterPage() {
   const [submitError, setSubmitError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleField = (key: keyof FormData, val: string) => {
+  const handleField = (key: keyof CaseFormData, val: string) => {
     setForm((p) => ({ ...p, [key]: val }));
     setErrors((p) => ({ ...p, [key]: undefined }));
   };
@@ -148,7 +145,7 @@ export default function RegisterPage() {
   };
 
   const validate = (): boolean => {
-    const errs: Partial<FormData> = {};
+    const errs: Partial<CaseFormData> = {};
     if (!form.name.trim()) errs.name = "Name is required";
     if (
       !form.age.trim() ||

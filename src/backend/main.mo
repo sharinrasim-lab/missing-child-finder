@@ -3,14 +3,14 @@ import Principal "mo:core/Principal";
 import Iter "mo:core/Iter";
 import Text "mo:core/Text";
 import Runtime "mo:core/Runtime";
-import MixinStorage "blob-storage/Mixin";
-import MixinAuthorization "authorization/MixinAuthorization";
-import AccessControl "authorization/access-control";
+import MixinObjectStorage "mo:caffeineai-object-storage/Mixin";
+import MixinAuthorization "mo:caffeineai-authorization/MixinAuthorization";
+import AccessControl "mo:caffeineai-authorization/access-control";
 
 
 
 actor {
-  include MixinStorage();
+  include MixinObjectStorage();
   let accessControlState = AccessControl.initState();
   include MixinAuthorization(accessControlState);
 

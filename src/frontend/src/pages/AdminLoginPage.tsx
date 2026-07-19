@@ -2,6 +2,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { useActor, useInternetIdentity } from "@caffeineai/core-infrastructure";
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -14,18 +15,14 @@ import {
 } from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
-import { useActor } from "../hooks/useActor";
-import { useInternetIdentity } from "../hooks/useInternetIdentity";
+import { createActor } from "../backend";
 
 export default function AdminLoginPage() {
   const navigate = useNavigate();
   const { login, loginStatus, identity } = useInternetIdentity();
-  const {
-    actor,
-    isFetching: actorLoading,
-    isError: actorError,
-    refetch: refetchActor,
-  } = useActor();
+  const { actor, isFetching: actorLoading } = useActor(createActor);
+  const actorError = !actor && !actorLoading;
+  const refetchActor = () => window.location.reload();
 
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);

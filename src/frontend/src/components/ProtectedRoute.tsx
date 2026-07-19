@@ -1,6 +1,6 @@
+import { useInternetIdentity } from "@caffeineai/core-infrastructure";
 import { Navigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
-import { useInternetIdentity } from "../hooks/useInternetIdentity";
 
 interface ProtectedRouteProps {
   children: ReactNode;
